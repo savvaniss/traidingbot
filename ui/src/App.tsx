@@ -1,29 +1,32 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { TrendingUp, TrendingDown, Activity, Play, Pause, Settings, Wallet, ShieldAlert, Signal, Info, RefreshCw } from "lucide-react";
 
 /**
  * Suggestions‑First UI for a Crypto Trading Assistant (Binance‑oriented)
  * ---------------------------------------------------------------------
- * - No auto‑trading yet. The bot computes signals and *suggests* actions.
- * - You can tweak risk and execution preferences, preview the order, and confirm manually.
- * - Market data + signals are mocked here; wire to your backend later.
+ * CONNECTED to your FastAPI backend:
+ *   GET  /tick?symbol=BTCUSDT            → latest price { symbol, price, ts }
+ *   GET  /signal?symbol=...&riskLevel=.. → suggestion { side, confidence, reasons[], stopPrice, takeProfit, targetExposureUsd, suggestedQtyBase }
+ *   GET  /balances                       → list of balances
+ *   POST /orders                         → paper/live order
  *
- * Tech decisions (per ChatGPT guidance):
- *  - Tailwind utilities (assumed available in environment)
- *  - shadcn/ui components can be swapped in later; kept minimal here
- *  - Framer Motion for subtle, polished animations
- *  - Lucide icons for quick visual cues
+ * Set BACKEND_URL below or via Vite env: VITE_BACKEND_URL
  */
 
-// ---------------------------
+// ==========================
+// Config
+// ==========================
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+
+// ==========================
 // Types
-// ---------------------------
+// ==========================
 
 type Ticker = {
   symbol: string;
   price: number;
-  ts: number;
+  ts: number; // epoch ms
 };
 
 type Signal = {
@@ -31,15 +34,16 @@ type Signal = {
   side: "BUY" | "SELL" | "FLAT";
   confidence: number; // 0..1
   reasons: Array<{ label: string; value: string | number; weight?: number }>; // Explainability
-  stopPrice?: number;
-  takeProfit?: number;
-  targetExposureUsd?: number;
+  stopPrice?: number | null;
+  takeProfit?: number | null;
+  targetExposureUsd?: number | null;
+  suggestedQtyBase?: number | null;
 };
 
 type Preference = {
   riskLevel: number; // 0..1 (maps to max exposure)
   maxExposureUsd: number; // absolute cap
-  preferMaker: boolean; // try post‑only first
+  preferMaker: boolean; // try post‑only first (placeholder for backend impl)
   slippageBps: number; // UI hint
   timeInForce: "GTC" | "IOC" | "FOK";
   paperTrading: boolean;
@@ -52,87 +56,82 @@ type OrderPreview = {
   notionalUsd: number;
   limitPrice?: number;
   estFeesUsd: number;
-  stopPrice?: number;
-  takeProfit?: number;
+  stopPrice?: number | null;
+  takeProfit?: number | null;
 };
 
-// ---------------------------
-// Mock data generator (replace with real sockets)
-// ---------------------------
+type Balance = { asset: string; free: number; locked: number };
 
-function useMockTicker(symbol: string) {
-  const [tick, setTick] = useState<Ticker>({ symbol, price: 68000, ts: Date.now() });
+// ==========================
+// Hooks (Backend‑connected)
+// ==========================
+
+function useBinanceTicker(symbol: string) {
+  const [tick, setTick] = useState<Ticker>({ symbol, price: 0, ts: 0 });
   useEffect(() => {
-    const id = setInterval(() => {
-      // Random walk
-      setTick((t) => {
-        const drift = (Math.random() - 0.5) * 50; // ±$25 per tick
-        const price = Math.max(100, t.price + drift);
-        return { symbol: t.symbol, price, ts: Date.now() };
-      });
-    }, 1000);
-    return () => clearInterval(id);
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/tick?symbol=${encodeURIComponent(symbol)}`);
+        if (!res.ok) throw new Error(`tick ${res.status}`);
+        const d = await res.json();
+        if (!cancelled) setTick({ symbol, price: Number(d.price || 0), ts: Number(d.ts || 0) });
+      } catch (e) {
+        if (!cancelled) setTick((t) => ({ ...t }));
+      }
+    };
+    poll();
+    const id = setInterval(poll, 1000);
+    return () => { cancelled = true; clearInterval(id); };
   }, [symbol]);
   return tick;
 }
 
-function useMockSignal(tick: Ticker): Signal {
-  // Simple moving average crossover mock using synthetic history in ref
-  const historyRef = useRef<number[]>([]);
-  const [sig, setSig] = useState<Signal>({ symbol: tick.symbol, side: "FLAT", confidence: 0.0, reasons: [] });
-
+function useBinanceSignal(symbol: string, riskLevel: number, maxExposureUsd: number) {
+  const [signal, setSignal] = useState<Signal>({ symbol, side: "FLAT", confidence: 0, reasons: [] });
   useEffect(() => {
-    historyRef.current = [...historyRef.current.slice(-99), tick.price];
-    const h = historyRef.current;
-    if (h.length < 50) {
-      setSig((s) => ({ ...s, symbol: tick.symbol, side: "FLAT", confidence: 0.2, reasons: [{ label: "Warm‑up", value: `${h.length}/50 bars` }] }));
-      return;
-    }
-    const ema = (arr: number[], span: number) => {
-      const k = 2 / (span + 1);
-      let e = arr[0];
-      for (let i = 1; i < arr.length; i++) e = arr[i] * k + e * (1 - k);
-      return e;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const params = new URLSearchParams({ symbol, riskLevel: String(riskLevel), maxExposureUsd: String(maxExposureUsd) });
+        const res = await fetch(`${BACKEND_URL}/signal?` + params.toString());
+        if (!res.ok) throw new Error(`signal ${res.status}`);
+        const d = await res.json();
+        if (!cancelled) setSignal(d);
+      } catch (e) {
+        if (!cancelled) setSignal((s) => ({ ...s, side: "FLAT", confidence: 0 }));
+      }
     };
-    const e20 = ema(h, 20);
-    const e50 = ema(h, 50);
-    const atr = (() => {
-      // poor man ATR proxy: stddev of last N deltas * factor
-      const deltas = h.slice(-50).map((x, i, a) => (i === 0 ? 0 : x - a[i - 1]));
-      const mean = deltas.reduce((a, b) => a + b, 0) / Math.max(1, deltas.length);
-      const varc = deltas.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, deltas.length);
-      return Math.sqrt(varc) * 2.5; // USD
-    })();
-
-    const side = e20 > e50 ? "BUY" : "SELL";
-    const trendStrength = Math.min(1, Math.abs(e20 - e50) / (atr || 1));
-    const confidence = Math.max(0.1, Math.min(0.95, trendStrength));
-
-    const stopPrice = side === "BUY" ? tick.price - 3 * atr : tick.price + 3 * atr;
-    const takeProfit = side === "BUY" ? tick.price + 4 * atr : tick.price - 4 * atr;
-
-    setSig({
-      symbol: tick.symbol,
-      side,
-      confidence,
-      reasons: [
-        { label: "EMA20", value: e20.toFixed(2), weight: 0.4 },
-        { label: "EMA50", value: e50.toFixed(2), weight: 0.3 },
-        { label: "ATR proxy", value: atr.toFixed(2), weight: 0.2 },
-        { label: "Trend strength", value: (trendStrength * 100).toFixed(1) + "%", weight: 0.1 },
-      ],
-      stopPrice,
-      takeProfit,
-      targetExposureUsd: 500 + 1500 * confidence,
-    });
-  }, [tick]);
-
-  return sig;
+    poll();
+    const id = setInterval(poll, 2000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [symbol, riskLevel, maxExposureUsd]);
+  return signal;
 }
 
-// ---------------------------
+function useBalances() {
+  const [balances, setBalances] = useState<Balance[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const fetchBalances = async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/balances`);
+        const data = await res.json();
+        if (!cancelled && Array.isArray(data)) setBalances(data);
+      } catch (e) {
+        if (!cancelled) setBalances([]);
+      }
+    };
+    fetchBalances();
+    const id = setInterval(fetchBalances, 10000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+  return balances;
+}
+
+// ==========================
 // UI helpers
-// ---------------------------
+// ==========================
 
 function Pill({ children, tone = "neutral" as "neutral" | "good" | "bad" }) {
   const tones: Record<string, string> = {
@@ -155,12 +154,12 @@ function Section({ title, icon, children }: { title: string; icon?: React.ReactN
   );
 }
 
-// ---------------------------
+// ==========================
 // Main App
-// ---------------------------
+// ==========================
 
 export default function CryptoSuggestionsUI() {
-  const [symbol, setSymbol] = useState("BTCUSDT");
+  const [symbol, setSymbol] = useState("BTCUSDC");
   const [pref, setPref] = useState<Preference>({
     riskLevel: 0.35,
     maxExposureUsd: 2000,
@@ -170,32 +169,44 @@ export default function CryptoSuggestionsUI() {
     paperTrading: true,
   });
 
-  const tick = useMockTicker(symbol);
-  const signal = useMockSignal(tick);
+  const tick = useBinanceTicker(symbol);
+  const signal = useBinanceSignal(symbol, pref.riskLevel, pref.maxExposureUsd);
+  const balances = useBalances();
 
   const orderPreview: OrderPreview | null = useMemo(() => {
-    if (signal.side === "FLAT") return null;
-    const notional = Math.min(signal.targetExposureUsd || 0, pref.maxExposureUsd) * pref.riskLevel;
-    const qty = notional / Math.max(1, tick.price);
-    const feeRate = 0.0001; // 1 bps (maker) rough
+    if (!signal || signal.side === "FLAT" || !tick.price) return null;
+
+    // Prefer backend suggested quantity (position-aware)
+    let qty = Number(signal.suggestedQtyBase || 0);
+    let notional = qty * tick.price;
+
+    // Fallback sizing if backend didn't provide qty
+    if (!qty || qty <= 0) {
+      const targetExposure = Math.min(signal.targetExposureUsd || 0, pref.maxExposureUsd) * pref.riskLevel;
+      if (targetExposure <= 0) return null;
+      qty = targetExposure / Math.max(1, tick.price);
+      notional = targetExposure;
+    }
+
+    const feeRate = 0.0001; // ~1 bps maker estimate
     const estFeesUsd = notional * feeRate;
     const limitAdj = pref.preferMaker ? (signal.side === "BUY" ? -1 : +1) * (tick.price * pref.slippageBps / 10000) : 0;
-    const limitPrice = Math.max(1, tick.price + limitAdj);
+    const limitPrice = pref.preferMaker ? Math.max(1, tick.price + limitAdj) : undefined;
+
     return {
       symbol,
-      side: signal.side,
+      side: signal.side as "BUY" | "SELL",
       qty: Number(qty.toFixed(6)),
       notionalUsd: Number(notional.toFixed(2)),
       estFeesUsd: Number(estFeesUsd.toFixed(2)),
-      limitPrice: pref.preferMaker ? Number(limitPrice.toFixed(2)) : undefined,
-      stopPrice: signal.stopPrice ? Number(signal.stopPrice.toFixed(2)) : undefined,
-      takeProfit: signal.takeProfit ? Number(signal.takeProfit.toFixed(2)) : undefined,
+      limitPrice: limitPrice ? Number(limitPrice.toFixed(2)) : undefined,
+      stopPrice: signal.stopPrice ?? null,
+      takeProfit: signal.takeProfit ?? null,
     };
   }, [signal, pref, tick.price, symbol]);
 
   const [connected, setConnected] = useState(false);
   useEffect(() => {
-    // simulate connectivity
     const id = setTimeout(() => setConnected(true), 600);
     return () => clearTimeout(id);
   }, []);
@@ -206,10 +217,22 @@ export default function CryptoSuggestionsUI() {
     if (!orderPreview) return;
     setSubmitting(true);
     try {
-      // In MVP we just log. Replace with POST /orders to your backend.
-      await new Promise((r) => setTimeout(r, 800));
-      console.log("PLACE ORDER", { orderPreview, preferences: pref });
+      const res = await fetch(`${BACKEND_URL}/orders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...orderPreview,
+          tif: pref.timeInForce,
+          preferMaker: pref.preferMaker,
+          paperTrading: pref.paperTrading,
+        }),
+      });
+      if (!res.ok) throw new Error(`orders ${res.status}`);
+      const data = await res.json();
+      console.log("ORDER RESPONSE", data);
       alert(`${pref.paperTrading ? "Paper" : "Live"} order submitted: ${orderPreview.side} ${orderPreview.qty} ${orderPreview.symbol}`);
+    } catch (e: any) {
+      alert(`Order failed: ${e?.message || e}`);
     } finally {
       setSubmitting(false);
     }
@@ -223,7 +246,7 @@ export default function CryptoSuggestionsUI() {
           <div className="w-9 h-9 rounded-2xl bg-black text-white grid place-items-center font-bold">CB</div>
           <div>
             <div className="text-sm font-semibold">Crypto Assistant • Suggestions‑First</div>
-            <div className="text-xs text-gray-500">Binance‑ready • No auto‑trading</div>
+            <div className="text-xs text-gray-500">Binance‑ready • Backend: {BACKEND_URL}</div>
           </div>
         </div>
         <div className="flex items-center gap-2 text-xs">
@@ -242,13 +265,17 @@ export default function CryptoSuggestionsUI() {
                 onChange={(e) => setSymbol(e.target.value)}
                 className="px-3 py-2 border rounded-xl text-sm"
               >
-                <option>BTCUSDT</option>
-                <option>ETHUSDT</option>
-                <option>BNBUSDT</option>
+                <option>BTCUSDC</option>
+                <option>ETHUSDC</option>
+                <option>BNBUSDC</option>
+                <option>DOGEUSDC</option>
+                <option>HBARUSDC</option>
+                <option>XLMUSDC</option>
+                <option>XRPUSDC</option>
               </select>
-              <div className="text-2xl font-semibold tabular-nums">${tick.price.toFixed(2)}</div>
-              <div className="text-xs text-gray-500">{new Date(tick.ts).toLocaleTimeString()}</div>
-              <button className="ml-auto inline-flex items-center gap-1 text-xs px-2 py-1 border rounded-lg hover:bg-gray-50">
+              <div className="text-2xl font-semibold tabular-nums">{tick.price ? `$${tick.price.toFixed(2)}` : "—"}</div>
+              <div className="text-xs text-gray-500">{tick.ts ? new Date(tick.ts).toLocaleTimeString() : ""}</div>
+              <button className="ml-auto inline-flex items-center gap-1 text-xs px-2 py-1 border rounded-lg hover:bg-gray-50" onClick={() => window.location.reload()}>
                 <RefreshCw className="w-3 h-3" /> Refresh
               </button>
             </div>
@@ -278,20 +305,20 @@ export default function CryptoSuggestionsUI() {
                   </div>
                 )}
                 <Pill tone={signal.confidence > 0.6 ? "good" : signal.confidence < 0.35 ? "bad" : "neutral"}>
-                  Confidence {(signal.confidence * 100).toFixed(0)}%
+                  Confidence {isFinite(signal.confidence) ? Math.round(signal.confidence * 100) : 0}%
                 </Pill>
               </motion.div>
             </div>
             <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-2">
-              {signal.reasons.map((r, i) => (
+              {(signal.reasons || []).map((r, i) => (
                 <div key={i} className="bg-gray-50 border border-gray-200 rounded-xl p-2">
                   <div className="text-[10px] uppercase tracking-wide text-gray-500">{r.label}</div>
-                  <div className="text-sm font-semibold tabular-nums">{r.value}</div>
+                  <div className="text-sm font-semibold tabular-nums">{String(r.value)}</div>
                 </div>
               ))}
             </div>
             <div className="mt-3 text-xs text-gray-600">
-              Risk guardrails suggested: {signal.stopPrice ? `Stop @ ${signal.stopPrice.toFixed(2)}` : "—"} • {signal.takeProfit ? `TP @ ${signal.takeProfit.toFixed(2)}` : "—"}
+              Risk guardrails suggested: {signal.stopPrice ? `Stop @ $${Number(signal.stopPrice).toFixed(2)}` : "—"} • {signal.takeProfit ? `TP @ $${Number(signal.takeProfit).toFixed(2)}` : "—"}
             </div>
           </Section>
 
@@ -325,11 +352,11 @@ export default function CryptoSuggestionsUI() {
                   </div>
                   <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
                     <div className="text-[10px] uppercase text-gray-500">Stop</div>
-                    <div className="font-semibold tabular-nums">{orderPreview.stopPrice ? `$${orderPreview.stopPrice.toFixed(2)}` : "—"}</div>
+                    <div className="font-semibold tabular-nums">{orderPreview.stopPrice ? `$${Number(orderPreview.stopPrice).toFixed(2)}` : "—"}</div>
                   </div>
                   <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
                     <div className="text-[10px] uppercase text-gray-500">Take profit</div>
-                    <div className="font-semibold tabular-nums">{orderPreview.takeProfit ? `$${orderPreview.takeProfit.toFixed(2)}` : "—"}</div>
+                    <div className="font-semibold tabular-nums">{orderPreview.takeProfit ? `$${Number(orderPreview.takeProfit).toFixed(2)}` : "—"}</div>
                   </div>
                 </div>
               </div>
@@ -408,6 +435,33 @@ export default function CryptoSuggestionsUI() {
             </div>
           </Section>
 
+          <Section title="Balances" icon={<Wallet className="w-4 h-4 text-gray-600" />}>
+            {balances.length === 0 ? (
+              <div className="text-sm text-gray-600">No balances or failed to fetch.</div>
+            ) : (
+              <div className="max-h-64 overflow-auto rounded-xl border border-gray-200">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50 sticky top-0">
+                    <tr className="text-gray-500 text-xs text-left">
+                      <th className="px-3 py-1">Asset</th>
+                      <th className="px-3 py-1">Free</th>
+                      <th className="px-3 py-1">Locked</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {balances.map((b, i) => (
+                      <tr key={i} className="border-t border-gray-200">
+                        <td className="px-3 py-1">{b.asset}</td>
+                        <td className="px-3 py-1 tabular-nums">{Number(b.free).toFixed(6)}</td>
+                        <td className="px-3 py-1 tabular-nums">{Number(b.locked).toFixed(6)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Section>
+
           <Section title="Risk Checks" icon={<ShieldAlert className="w-4 h-4 text-gray-600" />}> 
             <ul className="text-sm text-gray-700 list-disc pl-5 space-y-1">
               <li>Daily loss cap (planned)</li>
@@ -436,15 +490,12 @@ export default function CryptoSuggestionsUI() {
       <div className="max-w-6xl mx-auto mt-4">
         <Section title="What’s next" icon={<Settings className="w-4 h-4 text-gray-600" />}> 
           <ol className="text-sm text-gray-700 list-decimal pl-5 space-y-1">
-            <li>Replace the mock ticker/signal hooks with your backend WebSocket (live Binance Testnet data).</li>
-            <li>Create endpoints: <code className="bg-gray-100 px-1 rounded">GET /tick</code>, <code className="bg-gray-100 px-1 rounded">GET /signal</code>, <code className="bg-gray-100 px-1 rounded">POST /orders</code>.</li>
-            <li>Enable persistent storage for fills and orders, and render a trade log below the preview.</li>
-            <li>Add backtest panel with CSV upload and equity curve.</li>
+            <li>Ensure FastAPI backend is running at <code className="bg-gray-100 px-1 rounded">{BACKEND_URL}</code>.</li>
+            <li>Set <code className="bg-gray-100 px-1 rounded">VITE_BACKEND_URL</code> in a <code>.env</code> file if you need a different host/port.</li>
+            <li>Next upgrade: EMA/ATR signals + Binance filter snapping (lot size, minNotional).</li>
           </ol>
         </Section>
       </div>
     </div>
   );
 }
-
-
