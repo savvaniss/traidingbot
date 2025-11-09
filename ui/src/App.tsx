@@ -34,6 +34,7 @@ type Signal = {
   side: "BUY" | "SELL" | "FLAT";
   confidence: number; // 0..1
   reasons: Array<{ label: string; value: string | number; weight?: number }>; // Explainability
+  explanation?: string; // <— NEW
   stopPrice?: number | null;
   takeProfit?: number | null;
   targetExposureUsd?: number | null;
@@ -60,11 +61,50 @@ type OrderPreview = {
   takeProfit?: number | null;
 };
 
+type StrategyConfig = {
+  timeframe: "1m" | "3m" | "5m";
+  minAtrPct: number;
+  minAtrUsd: number;
+  confirmStreak: number;
+  flipCooldownSec: number;
+};
 type Balance = { asset: string; free: number; locked: number };
 
 // ==========================
 // Hooks (Backend‑connected)
 // ==========================
+function useStrategyConfig() {
+  const [cfg, setCfg] = useState<StrategyConfig>({
+    timeframe: "1m",
+    minAtrPct: 0.02,
+    minAtrUsd: 8.0,
+    confirmStreak: 2,
+    flipCooldownSec: 120,
+  });
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch(`${BACKEND_URL}/config`);
+        if (r.ok) setCfg(await r.json());
+      } catch {}
+    })();
+  }, []);
+
+  const update = async (patch: Partial<StrategyConfig>) => {
+    const next = { ...cfg, ...patch };
+    setCfg(next);
+    try {
+      await fetch(`${BACKEND_URL}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+    } catch {}
+  };
+
+  return [cfg, update] as const;
+}
 
 function useBinanceTicker(symbol: string) {
   const [tick, setTick] = useState<Ticker>({ symbol, price: 0, ts: 0 });
@@ -168,6 +208,7 @@ export default function CryptoSuggestionsUI() {
     timeInForce: "GTC",
     paperTrading: true,
   });
+  const [cfg, updateCfg] = useStrategyConfig();
 
   const tick = useBinanceTicker(symbol);
   const signal = useBinanceSignal(symbol, pref.riskLevel, pref.maxExposureUsd);
@@ -321,6 +362,68 @@ export default function CryptoSuggestionsUI() {
               Risk guardrails suggested: {signal.stopPrice ? `Stop @ $${Number(signal.stopPrice).toFixed(2)}` : "—"} • {signal.takeProfit ? `TP @ $${Number(signal.takeProfit).toFixed(2)}` : "—"}
             </div>
           </Section>
+<Section title="Strategy" icon={<Settings className="w-4 h-4 text-gray-600" />}>
+  <div className="space-y-3 text-sm">
+    <label className="flex items-center justify-between gap-2">
+      <span className="text-gray-700">Timeframe</span>
+      <select
+        className="px-2 py-1 border rounded-lg"
+        value={cfg.timeframe}
+        onChange={(e) => updateCfg({ timeframe: e.target.value as StrategyConfig["timeframe"] })}
+      >
+        <option value="1m">1 minute</option>
+        <option value="3m">3 minutes</option>
+        <option value="5m">5 minutes</option>
+      </select>
+    </label>
+
+    <label className="flex items-center justify-between gap-2">
+      <span className="text-gray-700">Min ATR %</span>
+      <input
+        type="number"
+        step={0.005}
+        className="w-24 px-2 py-1 border rounded-lg"
+        value={cfg.minAtrPct}
+        onChange={(e) => updateCfg({ minAtrPct: Number(e.target.value || 0) })}
+      />
+    </label>
+
+    <label className="flex items-center justify-between gap-2">
+      <span className="text-gray-700">Min ATR (USD)</span>
+      <input
+        type="number"
+        step={0.5}
+        className="w-24 px-2 py-1 border rounded-lg"
+        value={cfg.minAtrUsd}
+        onChange={(e) => updateCfg({ minAtrUsd: Number(e.target.value || 0) })}
+      />
+    </label>
+
+    <label className="flex items-center justify-between gap-2">
+      <span className="text-gray-700">Confirm streak</span>
+      <input
+        type="number"
+        min={1}
+        max={5}
+        className="w-20 px-2 py-1 border rounded-lg"
+        value={cfg.confirmStreak}
+        onChange={(e) => updateCfg({ confirmStreak: Number(e.target.value || 1) })}
+      />
+    </label>
+
+    <label className="flex items-center justify-between gap-2">
+      <span className="text-gray-700">Flip cooldown (sec)</span>
+      <input
+        type="number"
+        min={0}
+        step={10}
+        className="w-24 px-2 py-1 border rounded-lg"
+        value={cfg.flipCooldownSec}
+        onChange={(e) => updateCfg({ flipCooldownSec: Number(e.target.value || 0) })}
+      />
+    </label>
+  </div>
+</Section>
 
           <Section title="Order Preview" icon={<Wallet className="w-4 h-4 text-gray-600" />}> 
             {!orderPreview ? (

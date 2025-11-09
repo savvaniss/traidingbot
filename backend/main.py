@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from binance import AsyncClient, BinanceSocketManager
 from collections import deque
+from typing import Optional
 
 # Candle/history buffers per symbol
 CANDLE_MAX = 300  # ~5 hours of 1m bars
@@ -35,8 +36,14 @@ USE_TESTNET = True  # flip to False for mainnet later
 BIN_KEY = os.getenv("BINANCE_KEY_TESTNET")
 BIN_SEC = os.getenv("BINANCE_SEC_TESTNET")
 
-
-
+# --- Strategy config (live) ---
+DEFAULT_CONFIG = {
+    "timeframe": "1m",     # 1m | 3m | 5m
+    "minAtrPct": 0.02,     # % threshold for 1m (my suggested default)
+    "minAtrUsd": 8.0,      # absolute ATR floor in USD
+    "confirmStreak": 2,    # bars required to confirm a flip
+    "flipCooldownSec": 120 # seconds between flips
+}
 # ------------ caches & helpers ------------
 latest_prices: Dict[str, float] = {s: 0.0 for s in SYMBOLS}  # symbol -> last trade price
 latest_ts: Dict[str, int] = {s: 0 for s in SYMBOLS}          # symbol -> last trade ts (ms)
@@ -73,11 +80,11 @@ def atr(highs: List[float], lows: List[float], closes: List[float], length: int)
         trs.append(tr)
     return sum(trs) / len(trs)
 
-def decide_side(sym: str) -> Tuple[str, float, Dict[str, float]]:
-    """EMA20/EMA50 on closed candles with ATR filter + hysteresis/cooldown."""
+def decide_side(sym: str):
+    cfg = app.state.config
     buf = candles[sym]
     if len(buf) < max(EMA_SLOW + 1, ATR_LEN + 1):
-        return "FLAT", 0.2, {"reason": "warming_up", "bars": len(buf)}
+        return "FLAT", 0.2, {"explanation": "Warming up: not enough closed bars", "bars": len(buf)}
 
     closes = [c[3] for c in buf]
     highs  = [c[1] for c in buf]
@@ -89,45 +96,66 @@ def decide_side(sym: str) -> Tuple[str, float, Dict[str, float]]:
     price    = closes[-1]
 
     if ema_fast is None or ema_slow is None or curr_atr is None or price <= 0:
-        return "FLAT", 0.2, {"reason": "insufficient_data"}
+        return "FLAT", 0.2, {"explanation": "Insufficient data for indicators"}
 
-    atr_pct = (curr_atr / price) * 100
-
+    atr_pct = (curr_atr / price) * 100.0
     raw_side = "BUY" if ema_fast > ema_slow else "SELL" if ema_fast < ema_slow else "FLAT"
 
-    # Volatility guard: require ATR% >= threshold
-    if atr_pct < MIN_ATR_PCT:
-        raw_side = "FLAT"
+    # Volatility guard
+    if atr_pct < cfg["minAtrPct"] and curr_atr < cfg["minAtrUsd"]:
+        return "FLAT", 0.3, {
+            "explanation": "ATR below thresholds",
+            "ema_fast": ema_fast, "ema_slow": ema_slow,
+            "atr_pct": atr_pct, "atr_usd": curr_atr
+        }
 
     st = signal_state[sym]
     now = int(time.time())
 
-    # Hysteresis & cooldown
     if raw_side == "FLAT":
         st["streak"] = 0
-        return "FLAT", 0.3, {"ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct}
+        return "FLAT", 0.3, {
+            "explanation": "EMAs equal → no edge",
+            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct
+        }
 
     if raw_side == st["side"]:
         st["streak"] = 0
-        return st["side"], 0.6, {"ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct}
+        return st["side"], 0.6, {
+            "explanation": f"Holding {st['side']} (EMAs agree)",
+            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct
+        }
 
-    # raw_side != current side → build streak
+    # opposite → build streak
     st["streak"] += 1
-    if st["streak"] < CONFIRM_STREAK:
-        return "FLAT", 0.4, {"transition": raw_side, "streak": st["streak"], "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct}
+    if st["streak"] < cfg["confirmStreak"]:
+        return "FLAT", 0.4, {
+            "explanation": f"Transition to {raw_side} needs {cfg['confirmStreak'] - st['streak']} more bar(s)",
+            "streak": st["streak"], "target_side": raw_side,
+            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct
+        }
 
-    if now - st["last_flip"] < FLIP_COOLDOWN_SEC:
+    # cooldown
+    if now - st["last_flip"] < cfg["flipCooldownSec"]:
+        remain = cfg["flipCooldownSec"] - (now - st["last_flip"])
         st["streak"] = 0
-        return "FLAT", 0.4, {"cooldown": FLIP_COOLDOWN_SEC - (now - st["last_flip"])}
+        return "FLAT", 0.4, {
+            "explanation": f"Cooldown active: {remain}s",
+            "cooldown": remain
+        }
 
-    # flip confirmed
     st["side"] = raw_side
     st["last_flip"] = now
     st["streak"] = 0
-    return raw_side, 0.7, {"ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct}
+    return raw_side, 0.7, {
+        "explanation": f"{raw_side} confirmed (EMA{EMA_FAST}>{'<' if raw_side=='SELL' else '>'}EMA{EMA_SLOW})",
+        "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct
+    }
+
 
 # ------------ app ------------
 app = FastAPI()
+app.state.config = DEFAULT_CONFIG.copy()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -176,26 +204,28 @@ async def on_shutdown():
 async def refresh_candles_loop():
     """Refresh latest 1m candles for each symbol every ~5s using REST klines."""
     while not app.state.stop_event.is_set():
+        tf = app.state.config["timeframe"]  # "1m" | "3m" | "5m"
         try:
-            cli = await AsyncClient.create(api_key=BIN_KEY if BIN_KEY else None, api_secret=BIN_SEC if BIN_SEC else None, testnet=USE_TESTNET)
+            cli = await AsyncClient.create(
+                api_key=BIN_KEY if BIN_KEY else None,
+                api_secret=BIN_SEC if BIN_SEC else None,
+                testnet=USE_TESTNET
+            )
             for sym in SYMBOLS:
-                ks = await cli.get_klines(symbol=sym, interval="1m", limit=100)
-                # each k: [open_time, open, high, low, close, volume, close_time, ...]
+                ks = await cli.get_klines(symbol=sym, interval=tf, limit=200)
                 buf = candles[sym]
                 buf.clear()
                 for k in ks:
                     o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
                     buf.append((o, h, l, c))
-                # keep latest price aligned with close
                 latest_prices[sym] = float(ks[-1][4])
                 latest_ts[sym] = int(ks[-1][6])
         except Exception as e:
             print("kline loop error:", e)
         finally:
-            try:
-                await cli.close_connection()
-            except Exception:
-                pass
+            try: await cli.close_connection()
+            except Exception: pass
+
         await asyncio.sleep(5)
 
 async def stream_prices_loop():
@@ -241,6 +271,45 @@ async def refresh_balances_loop():
         await asyncio.sleep(10)
 
 # ------------ endpoints ------------
+class ConfigIn(BaseModel):
+    timeframe: Optional[str] = None      # "1m" | "3m" | "5m"
+    minAtrPct: Optional[float] = None
+    minAtrUsd: Optional[float] = None
+    confirmStreak: Optional[int] = None
+    flipCooldownSec: Optional[int] = None
+
+@app.get("/config")
+async def get_config():
+    return app.state.config
+
+@app.post("/config")
+async def set_config(cfg: ConfigIn):
+    current = app.state.config
+    changed_tf = False
+
+    if cfg.timeframe and cfg.timeframe != current["timeframe"]:
+        current["timeframe"] = cfg.timeframe
+        changed_tf = True
+
+    if cfg.minAtrPct is not None:
+        current["minAtrPct"] = max(0.0, float(cfg.minAtrPct))
+
+    if cfg.minAtrUsd is not None:
+        current["minAtrUsd"] = max(0.0, float(cfg.minAtrUsd))
+
+    if cfg.confirmStreak is not None:
+        current["confirmStreak"] = max(1, int(cfg.confirmStreak))
+
+    if cfg.flipCooldownSec is not None:
+        current["flipCooldownSec"] = max(0, int(cfg.flipCooldownSec))
+
+    # If timeframe changed, clear candle buffers to reload fresh with new TF
+    if changed_tf:
+        for sym in SYMBOLS:
+            candles[sym].clear()
+
+    return current
+    
 @app.get("/tick")
 async def tick(symbol: str = Query("BTCUSDC")):
     s = symbol.upper()
@@ -282,6 +351,7 @@ async def signal(
 
     # Strategy decision on CLOSED candles
     side, conf, diag = decide_side(s)
+    explanation = diag.get("explanation", "")
 
     base, quote = base_quote(s)
     base_qty = float(balances_cache.get(base, 0.0))
@@ -315,6 +385,7 @@ async def signal(
         "side": side,
         "confidence": conf,
         "reasons": reasons,
+        "explanation": explanation, 
         "stopPrice": None,
         "takeProfit": None,
         "targetExposureUsd": (min(maxExposureUsd, quote_qty) * riskLevel) if side == "BUY" else 0.0,
