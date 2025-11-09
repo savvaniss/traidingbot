@@ -1,86 +1,101 @@
 # backend/main.py
 import os, math, asyncio, time
 from typing import Dict, Tuple, List, Optional
+from collections import deque
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from binance import AsyncClient, BinanceSocketManager
-from collections import deque
-from typing import Optional
 
-# Candle/history buffers per symbol
-CANDLE_MAX = 300  # ~5 hours of 1m bars
-# Symbols to stream (add more as needed)
-SYMBOLS: List[str] = ["BTCUSDC", "ETHUSDC", "BNBUSDC", "DOGEUSDC", "HBARUSDC", "XLMUSDC", "SOLUSDC", "XRPUSDC"]
+# =========================================================
+# Config & constants
+# =========================================================
 
-candles = {s: deque(maxlen=CANDLE_MAX) for s in SYMBOLS}  # each item: (open, high, low, close)
+# Keep ~5 hours of 1m bars (or fewer if timeframe > 1m)
+CANDLE_MAX = 300
 
-# Signal state per symbol (for hysteresis/cooldown)
+# Symbols to trade/stream
+SYMBOLS: List[str] = [
+    "BTCUSDC", "ETHUSDC", "BNBUSDC", "DOGEUSDC",
+    "HBARUSDC", "XLMUSDC", "SOLUSDC", "XRPUSDC"
+]
+
+# Per-symbol buffers: (open, high, low, close)
+candles = {s: deque(maxlen=CANDLE_MAX) for s in SYMBOLS}
+
+# Flip control state
 signal_state = {
     s: {"side": "FLAT", "last_flip": 0, "streak": 0} for s in SYMBOLS
 }
 
+# Indicator params
 EMA_FAST = 20
 EMA_SLOW = 50
-ATR_LEN = 14
-CONFIRM_STREAK = 2          # need N consecutive closes agreeing with the new side
-FLIP_COOLDOWN_SEC = 120     # min seconds between side changes
-MIN_ATR_PCT = 0.15          # require ATR% of price >= this to trade (volatility guard)
+ATR_LEN  = 14
 
-# ------------ env & config ------------
-load_dotenv()  # loads .env if present
+# --- Live strategy config (editable via /config) ---
+DEFAULT_CONFIG = {
+    "timeframe": "1m",        # "1m" | "3m" | "5m"
+    "minAtrPct": 0.02,        # % ATR floor to avoid chop
+    "minAtrUsd": 8.0,         # absolute ATR floor in USD
+    "confirmStreak": 2,       # bars required to confirm a flip
+    "flipCooldownSec": 120,   # lockout after a flip (sec)
+    # --- NEW risk knobs ---
+    "stopAtrMult": 1.5,       # SL distance = ATR * this
+    "tpRiskMultiple": 2.0,    # TP distance = (entry - stop) * this
+}
 
-USE_TESTNET = True  # flip to False for mainnet later
+# Env
+load_dotenv()
+USE_TESTNET = True
 BIN_KEY = os.getenv("BINANCE_KEY_TESTNET")
 BIN_SEC = os.getenv("BINANCE_SEC_TESTNET")
 
-# --- Strategy config (live) ---
-DEFAULT_CONFIG = {
-    "timeframe": "1m",     # 1m | 3m | 5m
-    "minAtrPct": 0.02,     # % threshold for 1m (my suggested default)
-    "minAtrUsd": 8.0,      # absolute ATR floor in USD
-    "confirmStreak": 2,    # bars required to confirm a flip
-    "flipCooldownSec": 120 # seconds between flips
-}
-# ------------ caches & helpers ------------
-latest_prices: Dict[str, float] = {s: 0.0 for s in SYMBOLS}  # symbol -> last trade price
-latest_ts: Dict[str, int] = {s: 0 for s in SYMBOLS}          # symbol -> last trade ts (ms)
-balances_cache: Dict[str, float] = {}                        # asset -> free+locked qty (simple)
+# Caches
+latest_prices: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
+latest_ts: Dict[str, int]       = {s: 0 for s in SYMBOLS}
+balances_cache: Dict[str, float] = {}  # asset -> qty (free+locked)
+
+# =========================================================
+# Helpers
+# =========================================================
 
 def base_quote(symbol: str) -> Tuple[str, str]:
     s = symbol.upper()
-    if s.endswith("USDT"): return s[:-4], "USDT"
-    if s.endswith("USDC"): return s[:-4], "USDC"
-    if s.endswith("FDUSD"): return s[:-5], "FDUSD"
-    if s.endswith("TUSD"): return s[:-4], "TUSD"
-    # simple fallback; for production read exchangeInfo
+    for q in ("USDT", "USDC", "FDUSD", "TUSD"):
+        if s.endswith(q):
+            return s[:-len(q)], q
+    # naive fallback
     return s[:-3], s[-3:]
 
 def quantize(qty: float, step: float = 1e-6) -> float:
-    if step <= 0: return qty
-    return math.floor(qty / step) * step
+    return math.floor(qty / step) * step if step > 0 else qty
+
 def ema(series: List[float], length: int) -> Optional[float]:
     if len(series) < length:
         return None
     k = 2 / (length + 1)
-    ema_val = series[-length]
+    e = series[-length]
     for v in series[-length+1:]:
-        ema_val = v * k + ema_val * (1 - k)
-    return ema_val
+        e = v * k + e * (1 - k)
+    return e
 
 def atr(highs: List[float], lows: List[float], closes: List[float], length: int) -> Optional[float]:
     if len(closes) < length + 1:
         return None
     trs = []
     for i in range(-length, 0):
-        h, l, c_prev = highs[i], lows[i], closes[i-1]
-        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
-        trs.append(tr)
+        h, l, cprev = highs[i], lows[i], closes[i-1]
+        trs.append(max(h - l, abs(h - cprev), abs(l - cprev)))
     return sum(trs) / len(trs)
 
 def decide_side(sym: str):
+    """
+    Returns (side, confidence, diag)
+    diag includes: explanation, ema_fast, ema_slow, atr_pct, atr_usd, price
+    """
     cfg = app.state.config
     buf = candles[sym]
     if len(buf) < max(EMA_SLOW + 1, ATR_LEN + 1):
@@ -99,14 +114,14 @@ def decide_side(sym: str):
         return "FLAT", 0.2, {"explanation": "Insufficient data for indicators"}
 
     atr_pct = (curr_atr / price) * 100.0
-    raw_side = "BUY" if ema_fast > ema_slow else "SELL" if ema_fast < ema_slow else "FLAT"
+    raw_side = "BUY" if ema_fast > ema_slow else ("SELL" if ema_fast < ema_slow else "FLAT")
 
-    # Volatility guard
+    # Volatility guard → both floors must be low to block trading
     if atr_pct < cfg["minAtrPct"] and curr_atr < cfg["minAtrUsd"]:
         return "FLAT", 0.3, {
             "explanation": "ATR below thresholds",
             "ema_fast": ema_fast, "ema_slow": ema_slow,
-            "atr_pct": atr_pct, "atr_usd": curr_atr
+            "atr_pct": atr_pct, "atr_usd": curr_atr, "price": price
         }
 
     st = signal_state[sym]
@@ -116,14 +131,16 @@ def decide_side(sym: str):
         st["streak"] = 0
         return "FLAT", 0.3, {
             "explanation": "EMAs equal → no edge",
-            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct
+            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct,
+            "atr_usd": curr_atr, "price": price
         }
 
     if raw_side == st["side"]:
         st["streak"] = 0
         return st["side"], 0.6, {
             "explanation": f"Holding {st['side']} (EMAs agree)",
-            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct
+            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct,
+            "atr_usd": curr_atr, "price": price
         }
 
     # opposite → build streak
@@ -132,7 +149,8 @@ def decide_side(sym: str):
         return "FLAT", 0.4, {
             "explanation": f"Transition to {raw_side} needs {cfg['confirmStreak'] - st['streak']} more bar(s)",
             "streak": st["streak"], "target_side": raw_side,
-            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct
+            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct,
+            "atr_usd": curr_atr, "price": price
         }
 
     # cooldown
@@ -141,28 +159,34 @@ def decide_side(sym: str):
         st["streak"] = 0
         return "FLAT", 0.4, {
             "explanation": f"Cooldown active: {remain}s",
-            "cooldown": remain
+            "cooldown": remain,
+            "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct,
+            "atr_usd": curr_atr, "price": price
         }
 
+    # flip confirmed
     st["side"] = raw_side
     st["last_flip"] = now
     st["streak"] = 0
     return raw_side, 0.7, {
-        "explanation": f"{raw_side} confirmed (EMA{EMA_FAST}>{'<' if raw_side=='SELL' else '>'}EMA{EMA_SLOW})",
-        "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct
+        "explanation": f"{raw_side} confirmed (EMA{EMA_FAST} vs EMA{EMA_SLOW})",
+        "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct,
+        "atr_usd": curr_atr, "price": price
     }
 
+# =========================================================
+# App & lifecycle
+# =========================================================
 
-# ------------ app ------------
 app = FastAPI()
 app.state.config = DEFAULT_CONFIG.copy()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ------------ models ------------
 class OrderIn(BaseModel):
     symbol: str
     side: str                  # "BUY" | "SELL"
@@ -172,7 +196,6 @@ class OrderIn(BaseModel):
     preferMaker: bool = True
     paperTrading: bool = True  # if true -> echo only
 
-# ------------ lifecycle ------------
 @app.on_event("startup")
 async def on_startup():
     app.state.client = await AsyncClient.create(
@@ -182,15 +205,18 @@ async def on_startup():
     )
     app.state.bm = BinanceSocketManager(app.state.client)
     app.state.stop_event = asyncio.Event()
-    # background tasks
     app.state.stream_task = asyncio.create_task(stream_prices_loop())
     app.state.bal_task = asyncio.create_task(refresh_balances_loop())
-    app.state.kline_task = asyncio.create_task(refresh_candles_loop())  # <--- new
+    app.state.kline_task = asyncio.create_task(refresh_candles_loop())
 
 @app.on_event("shutdown")
 async def on_shutdown():
     app.state.stop_event.set()
-    for t in (getattr(app.state, "stream_task", None), getattr(app.state, "bal_task", None)):
+    for t in (
+        getattr(app.state, "stream_task", None),
+        getattr(app.state, "bal_task", None),
+        getattr(app.state, "kline_task", None),
+    ):
         if t:
             t.cancel()
             try:
@@ -200,11 +226,15 @@ async def on_shutdown():
     if getattr(app.state, "client", None):
         await app.state.client.close_connection()
 
-# ------------ background loops ------------
+# =========================================================
+# Background loops
+# =========================================================
+
 async def refresh_candles_loop():
-    """Refresh latest 1m candles for each symbol every ~5s using REST klines."""
+    """Refresh recent candles for each symbol every ~5s via REST klines."""
     while not app.state.stop_event.is_set():
-        tf = app.state.config["timeframe"]  # "1m" | "3m" | "5m"
+        tf = app.state.config["timeframe"]
+        cli = None
         try:
             cli = await AsyncClient.create(
                 api_key=BIN_KEY if BIN_KEY else None,
@@ -223,35 +253,32 @@ async def refresh_candles_loop():
         except Exception as e:
             print("kline loop error:", e)
         finally:
-            try: await cli.close_connection()
-            except Exception: pass
-
+            if cli:
+                try: await cli.close_connection()
+                except Exception: pass
         await asyncio.sleep(5)
 
 async def stream_prices_loop():
-    """Open a trade socket per symbol and keep latest price/ts up to date."""
-    async def run_socket(sym: string):
+    """Keep last trade price/ts fresh via trade sockets (per symbol)."""
+    async def run_socket(sym: str):
         sock = app.state.bm.trade_socket(sym.lower())
         async with sock as s:
             while not app.state.stop_event.is_set():
-                msg = await s.recv()  # {'p': price, 'T': ts, ...}
+                msg = await s.recv()
                 latest_prices[sym] = float(msg["p"])
                 latest_ts[sym] = int(msg["T"])
-
-    # gather all sockets concurrently
     await asyncio.gather(*(run_socket(sym) for sym in SYMBOLS))
 
 async def refresh_balances_loop():
-    """Refresh balances into cache every 10s (if keys provided)."""
+    """Refresh balances every 10s if keys are present."""
     if not BIN_KEY or not BIN_SEC:
-        # no keys -> nothing to do; keep loop alive so we can flip later
         while not app.state.stop_event.is_set():
             await asyncio.sleep(10)
         return
 
     while not app.state.stop_event.is_set():
+        cli = None
         try:
-            # reuse a short-lived REST client to avoid WS interference
             cli = await AsyncClient.create(api_key=BIN_KEY, api_secret=BIN_SEC, testnet=USE_TESTNET)
             acc = await cli.get_account()
             tmp = {}
@@ -264,19 +291,24 @@ async def refresh_balances_loop():
         except Exception as e:
             print("balances loop error:", e)
         finally:
-            try:
-                await cli.close_connection()
-            except Exception:
-                pass
+            if cli:
+                try: await cli.close_connection()
+                except Exception: pass
         await asyncio.sleep(10)
 
-# ------------ endpoints ------------
+# =========================================================
+# Config endpoints
+# =========================================================
+
 class ConfigIn(BaseModel):
-    timeframe: Optional[str] = None      # "1m" | "3m" | "5m"
+    timeframe: Optional[str] = None
     minAtrPct: Optional[float] = None
     minAtrUsd: Optional[float] = None
     confirmStreak: Optional[int] = None
     flipCooldownSec: Optional[int] = None
+    # NEW
+    stopAtrMult: Optional[float] = None
+    tpRiskMultiple: Optional[float] = None
 
 @app.get("/config")
 async def get_config():
@@ -291,37 +323,29 @@ async def set_config(cfg: ConfigIn):
         current["timeframe"] = cfg.timeframe
         changed_tf = True
 
-    if cfg.minAtrPct is not None:
-        current["minAtrPct"] = max(0.0, float(cfg.minAtrPct))
+    if cfg.minAtrPct is not None:       current["minAtrPct"] = max(0.0, float(cfg.minAtrPct))
+    if cfg.minAtrUsd is not None:       current["minAtrUsd"] = max(0.0, float(cfg.minAtrUsd))
+    if cfg.confirmStreak is not None:   current["confirmStreak"] = max(1, int(cfg.confirmStreak))
+    if cfg.flipCooldownSec is not None: current["flipCooldownSec"] = max(0, int(cfg.flipCooldownSec))
+    if cfg.stopAtrMult is not None:     current["stopAtrMult"] = max(0.1, float(cfg.stopAtrMult))
+    if cfg.tpRiskMultiple is not None:  current["tpRiskMultiple"] = max(0.1, float(cfg.tpRiskMultiple))
 
-    if cfg.minAtrUsd is not None:
-        current["minAtrUsd"] = max(0.0, float(cfg.minAtrUsd))
-
-    if cfg.confirmStreak is not None:
-        current["confirmStreak"] = max(1, int(cfg.confirmStreak))
-
-    if cfg.flipCooldownSec is not None:
-        current["flipCooldownSec"] = max(0, int(cfg.flipCooldownSec))
-
-    # If timeframe changed, clear candle buffers to reload fresh with new TF
     if changed_tf:
         for sym in SYMBOLS:
             candles[sym].clear()
-
     return current
-    
+
+# =========================================================
+# Data endpoints
+# =========================================================
+
 @app.get("/tick")
 async def tick(symbol: str = Query("BTCUSDC")):
     s = symbol.upper()
-    return {
-        "symbol": s,
-        "price": latest_prices.get(s, 0.0),
-        "ts": latest_ts.get(s, 0),
-    }
+    return {"symbol": s, "price": latest_prices.get(s, 0.0), "ts": latest_ts.get(s, 0)}
 
 @app.get("/balances")
 async def balances():
-    # if no keys, return empty (frontend can handle)
     return [{"asset": a, "free": q, "locked": 0.0} for a, q in sorted(balances_cache.items())]
 
 @app.get("/portfolio")
@@ -340,6 +364,10 @@ async def portfolio():
         lines.append({"asset": asset, "qty": qty, "price": px, "usdValue": usd})
     return {"equityUsd": equity, "positions": lines}
 
+# =========================================================
+# Signal (with SL/TP) & Orders
+# =========================================================
+
 @app.get("/signal")
 async def signal(
     symbol: str = Query("BTCUSDC"),
@@ -347,51 +375,65 @@ async def signal(
     maxExposureUsd: float = Query(2000.0, ge=0.0),
 ):
     s = symbol.upper()
-    px = latest_prices.get(s, 0.0)
 
     # Strategy decision on CLOSED candles
     side, conf, diag = decide_side(s)
     explanation = diag.get("explanation", "")
+    price = float(diag.get("price") or latest_prices.get(s, 0.0))
+    curr_atr = float(diag.get("atr_usd") or 0.0)
 
     base, quote = base_quote(s)
-    base_qty = float(balances_cache.get(base, 0.0))
+    base_qty  = float(balances_cache.get(base, 0.0))
     quote_qty = float(balances_cache.get(quote, 0.0))
 
+    # Position-aware sizing
     if side == "BUY":
         spendable_usd = min(quote_qty, maxExposureUsd) * riskLevel
-        target_base = (spendable_usd / px) if px > 0 else 0.0
+        target_base = (spendable_usd / price) if price > 0 else 0.0
         delta = max(0.0, target_base - base_qty)
     elif side == "SELL":
         target_base = 0.0
         delta = min(base_qty, base_qty - target_base)
     else:
         delta = 0.0
-
     suggested = quantize(delta, 1e-6)
 
+    # --- NEW: SL/TP from ATR ---
+    stop_price = None
+    take_profit = None
+    cfg = app.state.config
+    if price > 0 and curr_atr > 0 and side in ("BUY", "SELL"):
+        risk = cfg["stopAtrMult"] * curr_atr
+        if side == "BUY":
+            stop_price = max(0.01, price - risk)
+            take_profit = price + cfg["tpRiskMultiple"] * (price - stop_price)
+        else:
+            stop_price = price + risk
+            take_profit = price - cfg["tpRiskMultiple"] * (stop_price - price)
+
+    # Reasons for UI
     reasons = [
-        {"label": "Price", "value": round(px, 2)},
+        {"label": "Price", "value": round(price, 2)},
         {"label": "Base held", "value": round(base_qty, 6)},
         {"label": "Quote held", "value": round(quote_qty, 2)},
         {"label": "Risk level", "value": riskLevel},
         {"label": "Max exposure", "value": maxExposureUsd},
+        {"label": "EMA_FAST", "value": round(float(diag.get("ema_fast", 0.0)), 6)},
+        {"label": "EMA_SLOW", "value": round(float(diag.get("ema_slow", 0.0)), 6)},
+        {"label": "ATR_PCT", "value": round(float(diag.get("atr_pct", 0.0)), 6)},
     ]
-    # include diagnostics
-    for k, v in diag.items():
-        reasons.append({"label": k, "value": round(float(v), 6) if isinstance(v, (int, float)) else v})
 
     return {
         "symbol": s,
         "side": side,
         "confidence": conf,
         "reasons": reasons,
-        "explanation": explanation, 
-        "stopPrice": None,
-        "takeProfit": None,
+        "explanation": explanation,
+        "stopPrice": stop_price,
+        "takeProfit": take_profit,
         "targetExposureUsd": (min(maxExposureUsd, quote_qty) * riskLevel) if side == "BUY" else 0.0,
         "suggestedQtyBase": suggested,
     }
-
 
 @app.post("/orders")
 async def post_orders(order: OrderIn):
