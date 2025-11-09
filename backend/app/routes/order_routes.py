@@ -1,16 +1,22 @@
+# backend/app/routes/order_routes.py
 from fastapi import APIRouter, HTTPException
 from typing import Optional
-from ..models import OrderIn
-from ..config import BIN_KEY, BIN_SEC, USE_TESTNET
+from binance.exceptions import BinanceAPIException
+
+from ..config import BIN_KEY, BIN_SEC
 from ..exchange import make_client, place_order
 from ..state import log_order, order_log
+from ..models import OrderIn  # your Pydantic input model
+import time
 
 router = APIRouter()
+
 
 @router.get("/orders/recent")
 async def recent_orders(limit: int = 50):
     limit = max(1, min(200, limit))
     return list(reversed(order_log[-limit:]))
+
 
 @router.get("/orders/open")
 async def open_orders(symbol: Optional[str] = None):
@@ -24,6 +30,7 @@ async def open_orders(symbol: Optional[str] = None):
     finally:
         await cli.close_connection()
 
+
 @router.get("/orders/trades")
 async def recent_trades(symbol: str):
     if not BIN_KEY or not BIN_SEC:
@@ -34,23 +41,28 @@ async def recent_trades(symbol: str):
     finally:
         await cli.close_connection()
 
+
 @router.post("/orders")
 async def post_orders(order: OrderIn):
-    # Paper -> just log
     if order.paperTrading:
         entry = {
+            "ts": int(time.time()*1000),
             "symbol": order.symbol.upper(),
             "side": order.side.upper(),
             "qty": order.qty,
             "px": order.limitPrice,
             "mode": "paper",
-            "resp": None,
+            "status": "PAPER",
+            "orderId": None,
+            "executedQty": 0.0,
+            "cummulativeQuoteQty": 0.0,
+            "error": None,
         }
         log_order(entry)
-        return {"status": "paper_ok", "echo": order.dict()}
+        return {"status": "paper_ok"}
 
     if not BIN_KEY or not BIN_SEC:
-        raise HTTPException(status_code=400, detail="Missing BINANCE_KEY_TESTNET / BINANCE_SEC_TESTNET env vars.")
+        raise HTTPException(status_code=400, detail="Missing BINANCE_* env vars")
 
     cli = await make_client(BIN_KEY, BIN_SEC)
     try:
@@ -62,14 +74,119 @@ async def post_orders(order: OrderIn):
             order.preferMaker,
             order.limitPrice
         )
-        log_order({
+        entry = {
+            "ts": int(time.time()*1000),
+            "symbol": resp.get("symbol"),
+            "side": resp.get("side"),
+            "qty": float(resp.get("origQty", 0)),
+            "px": float(resp.get("price", 0)),
+            "mode": "live",
+            "status": resp.get("status"),              # NEW/ FILLED/ PARTIALLY_FILLED/ CANCELED
+            "orderId": resp.get("orderId"),
+            "executedQty": float(resp.get("executedQty", 0)),
+            "cummulativeQuoteQty": float(resp.get("cummulativeQuoteQty", 0)),
+            "error": None,
+        }
+        log_order(entry)
+        return {"status": "ok", "order": entry}
+    except BinanceAPIException as be:
+        entry = {
+            "ts": int(time.time()*1000),
             "symbol": order.symbol.upper(),
             "side": order.side.upper(),
             "qty": order.qty,
             "px": order.limitPrice,
             "mode": "live",
-            "resp": resp,
+            "status": "ERROR",
+            "orderId": None,
+            "executedQty": 0.0,
+            "cummulativeQuoteQty": 0.0,
+            "error": f"{be.status_code} {be.message}",
+        }
+        log_order(entry)
+        raise HTTPException(status_code=400, detail=entry["error"])
+    finally:
+        await cli.close_connection()
+
+@router.get("/orders/status")
+async def order_status(symbol: str, orderId: int):
+    """
+    Fetch the authoritative status of a specific order from Binance.
+    """
+    if not BIN_KEY or not BIN_SEC:
+        raise HTTPException(status_code=400, detail="API keys not configured")
+
+    cli = await make_client(BIN_KEY, BIN_SEC)
+    try:
+        r = await cli.get_order(symbol=symbol.upper(), orderId=int(orderId))
+        # return just the useful bits
+        return {
+            "symbol": r.get("symbol"),
+            "orderId": r.get("orderId"),
+            "status": r.get("status"),
+            "side": r.get("side"),
+            "price": float(r.get("price", 0)),
+            "origQty": float(r.get("origQty", 0)),
+            "executedQty": float(r.get("executedQty", 0)),
+            "cummulativeQuoteQty": float(r.get("cummulativeQuoteQty", 0)),
+            "time": r.get("time"),
+            "updateTime": r.get("updateTime"),
+            "type": r.get("type"),
+        }
+    finally:
+        await cli.close_connection()
+@router.post("/orders/cancel")
+async def cancel_order(symbol: str, orderId: int):
+    """
+    Cancel a single live order by symbol + orderId.
+    """
+    if not BIN_KEY or not BIN_SEC:
+        raise HTTPException(status_code=400, detail="Missing API keys.")
+    cli = await make_client(BIN_KEY, BIN_SEC)
+    try:
+        res = await cli.cancel_order(symbol=symbol.upper(), orderId=orderId)
+        # log a synthetic 'canceled' entry so UI updates instantly
+        log_order({
+            "t": int(time.time()),
+            "symbol": symbol.upper(),
+            "side": res.get("side", "BUY"),
+            "qty": float(res.get("origQty", "0") or 0),
+            "px": float(res.get("price", "0") or 0),
+            "mode": "live",
+            "status": "CANCELED",
+            "orderId": orderId,
         })
-        return {"status": "ok", "binance": resp}
+        return {"status": "canceled", "binance": res}
+    except BinanceAPIException as be:
+        raise HTTPException(status_code=be.status_code, detail=be.message)
+    finally:
+        await cli.close_connection()
+
+
+@router.post("/orders/cancel_all")
+async def cancel_all(symbol: str):
+    """
+    Cancel *all* open orders for a given symbol.
+    (Binance requires a symbol for bulk cancel.)
+    """
+    if not BIN_KEY or not BIN_SEC:
+        raise HTTPException(status_code=400, detail="Missing API keys.")
+    cli = await make_client(BIN_KEY, BIN_SEC)
+    try:
+        res = await cli.cancel_open_orders(symbol=symbol.upper())
+        # optional: log a single summary row
+        log_order({
+            "t": int(time.time()),
+            "symbol": symbol.upper(),
+            "side": "BUY",
+            "qty": 0.0,
+            "px": 0.0,
+            "mode": "live",
+            "status": "CANCELED",
+            "orderId": None,
+        })
+        return {"status": "canceled", "count": len(res), "binance": res}
+    except BinanceAPIException as be:
+        raise HTTPException(status_code=be.status_code, detail=be.message)
     finally:
         await cli.close_connection()

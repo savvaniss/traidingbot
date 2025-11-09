@@ -15,9 +15,6 @@ export default function ActionBar(
         {submitting ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
         {submitting ? "Submitting…" : label}
       </button>
-      <div className="mt-2 text-[11px] text-gray-500">
-        This interface suggests trades and requires your confirmation. No auto-trading is performed.
-      </div>
     </Section>
   );
 }
