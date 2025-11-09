@@ -1,0 +1,44 @@
+# --- Global ignores ---
+.DS_Store
+Thumbs.db
+.env
+*.log
+*.pyc
+__pycache__/
+*.sqlite3
+*.db
+
+# --- Python backend ---
+backend/venv/
+backend/__pycache__/
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/.coverage
+backend/.env
+backend/.vscode/
+backend/.idea/
+
+# --- Node frontend ---
+ui/node_modules/
+ui/.vite/
+ui/.vscode/
+ui/.idea/
+ui/.eslintcache
+ui/dist/
+ui/build/
+ui/.env
+ui/.DS_Store
+ui/npm-debug.log*
+ui/yarn-debug.log*
+ui/yarn-error.log*
+ui/package-lock.json
+
+# --- OS / Editor ---
+*.swp
+*.swo
+*.bak
+*.tmp
+*.log
+.vscode/
+.idea/
