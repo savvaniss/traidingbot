@@ -21,6 +21,8 @@ import StrategyForm from "./components/StrategyForm";
 import BalancesTable from "./components/BalancesTable";
 import OrderPreviewCard from "./components/OrderPreviewCard";
 import ActionBar from "./components/ActionBar";
+import AutoTradePanel from "./components/AutoTradePanel";
+
 
 export default function App() {
   const [symbol, setSymbol] = useState("BTCUSDC");
@@ -195,6 +197,7 @@ export default function App() {
             onClick={handlePlaceOrder}
             label={orderPreview ? `Confirm ${orderPreview.side}` : "Waiting for signal"}
           />
+            <AutoTradePanel />
         </div>
       </div>
 
