@@ -1,10 +1,14 @@
+// src/components/AutoTradePanel.tsx
 import React, { useEffect, useState } from "react";
-import { BACKEND_URL } from "../config";
+import { BACKEND_URL, SYMBOLS as DEFAULT_SYMBOLS } from "../config";
 import type { AutoTradeStatus } from "../types";
 
-const ALL = ["BTCUSDC","ETHUSDC","BNBUSDC","DOGEUSDC","HBARUSDC","XLMUSDC","SOLUSDC","XRPUSDC"];
+// ❌ remove the hardcoded USDC list
+// const ALL = [...]
 
-export default function AutoTradePanel() {
+export default function AutoTradePanel({ symbols = DEFAULT_SYMBOLS }: {
+  symbols?: string[];
+}) {
   const [status, setStatus] = useState<AutoTradeStatus>({ enabled: false, symbols: [] });
   const [saving, setSaving] = useState(false);
 
@@ -12,22 +16,33 @@ export default function AutoTradePanel() {
     try {
       const res = await fetch(`${BACKEND_URL}/autotrade`);
       const data = await res.json();
-      setStatus(data);
+
+      // guard: keep only symbols that exist in current UI set
+      const filtered = (data.symbols ?? []).filter((s: string) => symbols.includes(s));
+      setStatus({ enabled: !!data.enabled, symbols: filtered });
     } catch { /* ignore */ }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [symbols.join(",")]);
+
+  const post = async (next: Partial<AutoTradeStatus>) => {
+    const body = JSON.stringify({
+      enabled: next.enabled ?? status.enabled,
+      symbols: next.symbols ?? status.symbols,
+    });
+    const res = await fetch(`${BACKEND_URL}/autotrade`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    const data = await res.json();
+    const filtered = (data.symbols ?? []).filter((s: string) => symbols.includes(s));
+    setStatus({ enabled: !!data.enabled, symbols: filtered });
+  };
 
   const toggle = async () => {
     setSaving(true);
-    try {
-      const res = await fetch(`${BACKEND_URL}/autotrade`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: !status.enabled, symbols: status.symbols }),
-      });
-      setStatus(await res.json());
-    } finally { setSaving(false); }
+    try { await post({ enabled: !status.enabled }); } finally { setSaving(false); }
   };
 
   const toggleSymbol = async (sym: string) => {
@@ -35,14 +50,7 @@ export default function AutoTradePanel() {
       ? status.symbols.filter(s => s !== sym)
       : [...status.symbols, sym];
     setSaving(true);
-    try {
-      const res = await fetch(`${BACKEND_URL}/autotrade`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: status.enabled, symbols: next }),
-      });
-      setStatus(await res.json());
-    } finally { setSaving(false); }
+    try { await post({ symbols: next }); } finally { setSaving(false); }
   };
 
   return (
@@ -57,11 +65,11 @@ export default function AutoTradePanel() {
           {status.enabled ? "Stop" : "Start"}
         </button>
       </div>
-      <div className="text-xs text-gray-600 mb-2">
-        Select symbols to include in the bot’s loop:
-      </div>
+
+      <div className="text-xs text-gray-600 mb-2">Select symbols to include in the bot’s loop:</div>
+
       <div className="flex flex-wrap gap-2">
-        {ALL.map(sym => {
+        {symbols.map(sym => {
           const active = status.symbols.includes(sym);
           return (
             <button
@@ -75,8 +83,12 @@ export default function AutoTradePanel() {
           );
         })}
       </div>
+
       <div className="mt-3 text-[11px] text-gray-500">
-        Status: <span className={`font-medium ${status.enabled ? "text-green-700" : "text-gray-700"}`}>{status.enabled ? "Running" : "Idle"}</span>
+        Status:{" "}
+        <span className={`font-medium ${status.enabled ? "text-green-700" : "text-gray-700"}`}>
+          {status.enabled ? "Running" : "Idle"}
+        </span>
         {" • "}Selected: {status.symbols.length ? status.symbols.join(", ") : "—"}
       </div>
     </div>

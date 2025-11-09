@@ -8,10 +8,18 @@ BIN_KEY = os.getenv("BINANCE_KEY_TESTNET")
 BIN_SEC = os.getenv("BINANCE_SEC_TESTNET")
 
 # Symbols you watch/trade
-SYMBOLS = [
-    "BTCUSDC","ETHUSDC","BNBUSDC","DOGEUSDC",
-    "HBARUSDC","XLMUSDC","SOLUSDC","XRPUSDC"
-]
+# Symbols you watch/trade
+if USE_TESTNET:
+    SYMBOLS = [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT",
+        "HBARUSDT", "XLMUSDT", "SOLUSDT", "XRPUSDT",
+    ]
+else:
+    SYMBOLS = [
+        "BTCUSDC","ETHUSDC","BNBUSDC","DOGEUSDC",
+        "HBARUSDC","XLMUSDC","SOLUSDC","XRPUSDC"
+    ]
+
 
 # Keep ~5h of 1m candles
 CANDLE_MAX = 300

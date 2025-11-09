@@ -46,13 +46,44 @@ export type OrderPreview = {
 
 /** === New: orders log entry (from /orders/recent) === */
 export type OrderLogEntry = {
-  t: number;             // epoch seconds (added by backend)
+  // time may be logged as seconds (t) or ms (ts) depending on your logger
+  t?: number;          // seconds epoch
+  ts?: number;         // milliseconds epoch
+
   symbol: string;
   side: "BUY" | "SELL";
   qty: number;
-  px?: number | null;    // limit price (if present) or undefined
+  px: number | null;
   mode: "paper" | "live";
-  resp?: unknown;        // raw binance response (optional)
+
+  // new/optional fields
+  status?:
+    | "PAPER"
+    | "NEW"
+    | "PARTIALLY_FILLED"
+    | "FILLED"
+    | "CANCELED"
+    | "REJECTED"
+    | "EXPIRED"
+    | "ERROR";
+  orderId?: number | null;
+  executedQty?: number;
+  cummulativeQuoteQty?: number;
+  error?: string | null;
+};
+
+export type OrderStatusRes = {
+  symbol: string;
+  orderId: number;
+  status: string;
+  side: string;
+  price: number;
+  origQty: number;
+  executedQty: number;
+  cummulativeQuoteQty: number;
+  time: number;
+  updateTime: number;
+  type: string;
 };
 
 /** === New: autotrade status === */

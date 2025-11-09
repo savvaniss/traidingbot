@@ -6,7 +6,7 @@ import {
   TrendingDown, TrendingUp
 } from "lucide-react";
 
-import { BACKEND_URL } from "./config";
+import { BACKEND_URL, SYMBOLS } from "./config";
 import type { OrderPreview, Preference } from "./types";
 
 import useTicker from "./hooks/useTicker";
@@ -26,7 +26,7 @@ import AutoTradePanel from "./components/AutoTradePanel";
 import OrdersTable from "./components/OrdersTable";
 
 export default function App() {
-  const [symbol, setSymbol] = useState("BTCUSDC");
+  const [symbol, setSymbol] = useState(SYMBOLS[0]);  //  default from config
   const [pref, setPref] = useState<Preference>({
     riskLevel: 0.35,
     maxExposureUsd: 2000,
@@ -41,7 +41,6 @@ export default function App() {
   const signal = useSignal(symbol, pref.riskLevel, pref.maxExposureUsd);
   const balances = useBalances();
   const { orders } = useOrdersRecent(50, 2000);
-
   const orderPreview = useMemo<OrderPreview | null>(() => {
     if (!signal || signal.side === "FLAT" || !tick.price) return null;
 
@@ -153,13 +152,7 @@ export default function App() {
                 onChange={(e) => setSymbol(e.target.value)}
                 className="px-3 py-2 border rounded-xl text-sm"
               >
-                <option>BTCUSDC</option>
-                <option>ETHUSDC</option>
-                <option>BNBUSDC</option>
-                <option>DOGEUSDC</option>
-                <option>HBARUSDC</option>
-                <option>XLMUSDC</option>
-                <option>XRPUSDC</option>
+    {SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
               <div className="text-2xl font-semibold tabular-nums">
                 {tick.price ? `$${tick.price.toFixed(2)}` : "—"}
@@ -247,23 +240,10 @@ export default function App() {
           />
           {/* NEW: Auto-trade controls */}
           <AutoTradePanel />
+
         </div>
       </div>
 
-      <div className="max-w-6xl mx-auto mt-4">
-        <Section title="What’s next" icon={<Signal className="w-4 h-4 text-gray-600" />}>
-          <ol className="text-sm text-gray-700 list-decimal pl-5 space-y-1">
-            <li>
-              Ensure FastAPI backend is running at{" "}
-              <code className="bg-gray-100 px-1 rounded">{BACKEND_URL}</code>.
-            </li>
-            <li>
-              Set <code className="bg-gray-100 px-1 rounded">VITE_BACKEND_URL</code> in a <code>.env</code> file if needed.
-            </li>
-            <li>Next: snap qty/price to Binance filters (lot size / minNotional).</li>
-          </ol>
-        </Section>
-      </div>
     </div>
   );
 }

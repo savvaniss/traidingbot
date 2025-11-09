@@ -11,6 +11,8 @@ from .routes.data_routes import router as data_router
 from .routes.signal_routes import router as signal_router
 from .routes.order_routes import router as order_router
 from .routes.autotrade_routes import router as autotrade_router
+from .exchange import make_client, load_exchange_filters
+from .config import BIN_KEY, BIN_SEC
 
 def create_app() -> FastAPI:
     app = FastAPI()
@@ -32,6 +34,9 @@ def create_app() -> FastAPI:
         app.state.stop_event = asyncio.Event()
         # shared WS client for price sockets
         app.state.shared_client = await make_client(BIN_KEY, BIN_SEC) if (BIN_KEY and BIN_SEC) else await make_client(None, None)
+        await load_exchange_filters(BIN_KEY if BIN_KEY else None, BIN_SEC if BIN_SEC else None)
+
+
         app.state.tasks = [
             asyncio.create_task(stream_prices_loop(app.state.stop_event, app.state.shared_client)),
             asyncio.create_task(refresh_candles_loop(app.state.stop_event, lambda: make_client(BIN_KEY, BIN_SEC))),
