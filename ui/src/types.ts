@@ -44,9 +44,19 @@ export type OrderPreview = {
   takeProfit?: number | null;
 };
 
-// src/types.ts
-export type Ticker = {
+/** === New: orders log entry (from /orders/recent) === */
+export type OrderLogEntry = {
+  t: number;             // epoch seconds (added by backend)
   symbol: string;
-  price: number;
-  ts: number; // epoch ms
+  side: "BUY" | "SELL";
+  qty: number;
+  px?: number | null;    // limit price (if present) or undefined
+  mode: "paper" | "live";
+  resp?: unknown;        // raw binance response (optional)
+};
+
+/** === New: autotrade status === */
+export type AutoTradeStatus = {
+  enabled: boolean;
+  symbols: string[];
 };
