@@ -135,3 +135,58 @@ async def order_status(symbol: str, orderId: int):
         }
     finally:
         await cli.close_connection()
+@router.post("/orders/cancel")
+async def cancel_order(symbol: str, orderId: int):
+    """
+    Cancel a single live order by symbol + orderId.
+    """
+    if not BIN_KEY or not BIN_SEC:
+        raise HTTPException(status_code=400, detail="Missing API keys.")
+    cli = await make_client(BIN_KEY, BIN_SEC)
+    try:
+        res = await cli.cancel_order(symbol=symbol.upper(), orderId=orderId)
+        # log a synthetic 'canceled' entry so UI updates instantly
+        log_order({
+            "t": int(time.time()),
+            "symbol": symbol.upper(),
+            "side": res.get("side", "BUY"),
+            "qty": float(res.get("origQty", "0") or 0),
+            "px": float(res.get("price", "0") or 0),
+            "mode": "live",
+            "status": "CANCELED",
+            "orderId": orderId,
+        })
+        return {"status": "canceled", "binance": res}
+    except BinanceAPIException as be:
+        raise HTTPException(status_code=be.status_code, detail=be.message)
+    finally:
+        await cli.close_connection()
+
+
+@router.post("/orders/cancel_all")
+async def cancel_all(symbol: str):
+    """
+    Cancel *all* open orders for a given symbol.
+    (Binance requires a symbol for bulk cancel.)
+    """
+    if not BIN_KEY or not BIN_SEC:
+        raise HTTPException(status_code=400, detail="Missing API keys.")
+    cli = await make_client(BIN_KEY, BIN_SEC)
+    try:
+        res = await cli.cancel_open_orders(symbol=symbol.upper())
+        # optional: log a single summary row
+        log_order({
+            "t": int(time.time()),
+            "symbol": symbol.upper(),
+            "side": "BUY",
+            "qty": 0.0,
+            "px": 0.0,
+            "mode": "live",
+            "status": "CANCELED",
+            "orderId": None,
+        })
+        return {"status": "canceled", "count": len(res), "binance": res}
+    except BinanceAPIException as be:
+        raise HTTPException(status_code=be.status_code, detail=be.message)
+    finally:
+        await cli.close_connection()
